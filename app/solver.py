@@ -10,13 +10,23 @@
 - 所有节点按 ID 排序后建图，BFS 按固定邻接顺序遍历，算法完全确定：
   相同输入（甚至不同的列表顺序）必然产生完全相同的分配结果。
 
+分赛道容量（稿件携带 track、评审人声明 track_capacities 时）在稿件与评审人
+之间插入一层「(评审人, 赛道)」限额节点：
+
+    稿件 --(1)--> (评审人, 赛道) --(赛道限额)--> 评审人 --(总容量)--> 汇点
+
+赛道受限稿件的流量同时经过赛道限额边与总容量边，两级约束在同一个流网络中
+联立求解（而非分赛道独立求解后拼接）；赛道未列入该评审人映射、或稿件不携带
+track 时仍走 稿件->评审人 直边，只受总容量约束。
+
 增量重排模式（请求携带 previous_assignments / locked_assignments 时）：
 
-- 锁定关系先逐一校验稿件需求、评审资格与容量，任一冲突即整体不可行，
-  返回结构化冲突原因，不输出任何部分分配；
-- 合法锁定关系固化为必留边（扣减稿件剩余需求与评审剩余容量），其余名额用
-  最小费用最大流求解：复用 previous_assignments 的边费用为 0、新增边费用为 1。
-  流量固定时费用最小 <=> 复用上一轮的边最多 <=> 新增+移除的关系总数最少；
+- 锁定关系先逐一校验稿件需求、评审资格、总容量与分赛道限额，任一冲突即整体
+  不可行，返回结构化冲突原因，不输出任何部分分配；
+- 合法锁定关系固化为必留边（扣减稿件剩余需求、评审剩余总容量与剩余赛道限额），
+  其余名额用最小费用最大流求解：复用 previous_assignments 的边费用为 0、
+  新增边费用为 1。流量固定时费用最小 <=> 复用上一轮的边最多 <=> 新增+移除的
+  关系总数最少；复用边同样流经赛道限额节点，历史关系仅在两级容量均允许时复用；
 - 增广路按 (费用, 节点下标) 字典序选取，节点下标来自 ID 排序：
   同成本解由 ID 顺序确定性地破除，输出完全确定。
 """
@@ -34,6 +44,7 @@ class ManuscriptSpec:
     authors: tuple[str, ...]
     topics: tuple[str, ...]
     required_reviewers: int
+    track: str | None = None
 
 
 @dataclass(frozen=True)
@@ -43,6 +54,8 @@ class ReviewerSpec:
     capacity: int
     conflicted_authors: tuple[str, ...]
     conflicted_manuscripts: tuple[str, ...]
+    # (赛道, 限额) 对，按赛道名排序；缺省为空表示不做分赛道限制
+    track_capacities: tuple[tuple[str, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -60,7 +73,8 @@ class UnsatisfiedManuscript:
 # 锁定关系冲突类型：
 #   unknown_manuscript / unknown_reviewer  —— 引用了不存在的稿件 / 评审人
 #   self_conflict / author_conflict / manuscript_conflict / topic_mismatch —— 评审资格
-#   reviewer_capacity_exceeded             —— 锁定数超出评审容量
+#   reviewer_capacity_exceeded             —— 锁定数超出评审总容量
+#   reviewer_track_capacity_exceeded       —— 锁定数超出评审某赛道限额（track 给出赛道）
 #   manuscript_requirement_exceeded        —— 锁定数超出稿件所需评审数
 @dataclass(frozen=True)
 class LockedConflict:
@@ -70,6 +84,7 @@ class LockedConflict:
     locked: int | None
     limit: int | None
     detail: str
+    track: str | None = None
 
 
 @dataclass(frozen=True)
@@ -276,17 +291,47 @@ def solve_assignment(
     )
 
 
+def _track_node_layout(
+    m_count: int, rs: list[ReviewerSpec]
+) -> tuple[list[dict[str, int]], int]:
+    """为每个评审人声明的赛道限额分配图节点（紧跟评审人节点之后）。
+
+    返回 (评审人下标 -> {赛道: 节点下标}, 下一可用节点下标)。评审人已按 ID
+    排序、赛道按名称排序：节点编号与输入列表顺序无关，保证结果确定。
+    """
+    nxt = 1 + m_count + len(rs)
+    layout: list[dict[str, int]] = []
+    for r in rs:
+        nodes: dict[str, int] = {}
+        for track, _cap in sorted(r.track_capacities):
+            nodes[track] = nxt
+            nxt += 1
+        layout.append(nodes)
+    return layout, nxt
+
+
 def _solve_normal(ms: list[ManuscriptSpec], rs: list[ReviewerSpec]) -> SolveResult:
     m_count, r_count = len(ms), len(rs)
 
     SRC = 0
-    SNK = 1 + m_count + r_count
+    # 节点布局：SRC | 稿件 | 评审人 | (评审人, 赛道) 限额节点 | SNK
+    track_nodes, SNK = _track_node_layout(m_count, rs)
+    track_caps = [dict(r.track_capacities) for r in rs]
 
     def m_node(i: int) -> int:
         return 1 + i
 
     def r_node(j: int) -> int:
         return 1 + m_count + j
+
+    def mr_target(i: int, j: int) -> int:
+        """稿件 i -> 评审人 j 的边指向：赛道受该评审人限额约束时走限额节点。"""
+        track = ms[i].track
+        if track is not None:
+            node = track_nodes[j].get(track)
+            if node is not None:
+                return node
+        return r_node(j)
 
     eligible = [_eligible_reviewers(m, rs) for m in ms]
 
@@ -295,18 +340,24 @@ def _solve_normal(ms: list[ManuscriptSpec], rs: list[ReviewerSpec]) -> SolveResu
         mf.add_edge(SRC, m_node(i), m.required_reviewers)
     for i in range(m_count):
         for j in eligible[i]:
-            mf.add_edge(m_node(i), r_node(j), 1)
+            mf.add_edge(m_node(i), mr_target(i, j), 1)
     for j, r in enumerate(rs):
+        for track, node in track_nodes[j].items():
+            mf.add_edge(node, r_node(j), track_caps[j][track])
         mf.add_edge(r_node(j), SNK, r.capacity)
 
     total_required = sum(m.required_reviewers for m in ms)
     total_assigned = mf.max_flow(SRC, SNK)
 
-    # 提取分配：m->r 原始容量为 1，反向残余容量即该边流量
+    # 提取分配：m->r（或 m->(r,赛道)）原始容量为 1，反向残余容量即该边流量
     flow_assignment: dict[str, tuple[str, ...]] = {}
     for i, m in enumerate(ms):
         picked = tuple(
-            sorted(rs[j].id for j in eligible[i] if mf.cap[r_node(j)][m_node(i)] > 0)
+            sorted(
+                rs[j].id
+                for j in eligible[i]
+                if mf.cap[mr_target(i, j)][m_node(i)] > 0
+            )
         )
         flow_assignment[m.id] = picked
 
@@ -321,6 +372,15 @@ def _solve_normal(ms: list[ManuscriptSpec], rs: list[ReviewerSpec]) -> SolveResu
         )
 
     # ---- 不可行：诊断缺口，不输出任何部分分配 ----
+    def remaining_capacity(j: int, track: str | None) -> int:
+        """评审人 j 对该赛道稿件的剩余可接量：总剩余与赛道剩余取小。"""
+        remaining = mf.cap[r_node(j)][SNK]
+        if track is not None:
+            node = track_nodes[j].get(track)
+            if node is not None:
+                remaining = min(remaining, mf.cap[node][r_node(j)])
+        return remaining
+
     unsatisfied: list[UnsatisfiedManuscript] = []
     unsat_idx: list[int] = []
     for i, m in enumerate(ms):
@@ -329,7 +389,7 @@ def _solve_normal(ms: list[ManuscriptSpec], rs: list[ReviewerSpec]) -> SolveResu
             continue
         missing = m.required_reviewers - assigned
         elig = eligible[i]
-        remaining = sum(mf.cap[r_node(j)][SNK] for j in elig)
+        remaining = sum(remaining_capacity(j, m.track) for j in elig)
         unsatisfied.append(
             UnsatisfiedManuscript(
                 manuscript_id=m.id,
@@ -371,7 +431,7 @@ def _check_locked(
     rs: list[ReviewerSpec],
     locked: frozenset[tuple[str, str]],
 ) -> tuple[dict[str, tuple[str, ...]], tuple[LockedConflict, ...]]:
-    """校验锁定关系：评审资格（逐对）、评审容量、稿件需求。
+    """校验锁定关系：评审资格（逐对）、评审总容量与分赛道限额、稿件需求。
 
     返回 (每个稿件合法锁定的评审人元组, 冲突列表)；冲突非空即整体不可行。
     """
@@ -419,6 +479,28 @@ def _check_locked(
                 locked=n_locked, limit=r.capacity,
                 detail=f"评审人 {rid} 被锁定 {n_locked} 篇稿件，超出其容量 {r.capacity}",
             ))
+    # 分赛道限额校验：锁定关系同样占用赛道容量
+    for rid in sorted(locked_by_r):
+        caps = dict(r_by_id[rid].track_capacities)
+        if not caps:
+            continue
+        per_track: dict[str, int] = {}
+        for mid in locked_by_r[rid]:
+            track = m_by_id[mid].track
+            if track is not None and track in caps:
+                per_track[track] = per_track.get(track, 0) + 1
+        for track in sorted(per_track):
+            n_locked = per_track[track]
+            limit = caps[track]
+            if n_locked > limit:
+                conflicts.append(LockedConflict(
+                    type="reviewer_track_capacity_exceeded",
+                    manuscript_id=None, reviewer_id=rid,
+                    locked=n_locked, limit=limit,
+                    detail=f"评审人 {rid} 在赛道 {track} 被锁定 {n_locked} 篇稿件，"
+                           f"超出其赛道限额 {limit}",
+                    track=track,
+                ))
     for mid in sorted(locked_by_m):
         m = m_by_id[mid]
         n_locked = len(locked_by_m[mid])
@@ -430,7 +512,9 @@ def _check_locked(
                        f"{m.required_reviewers}",
             ))
 
-    conflicts.sort(key=lambda c: (c.type, c.manuscript_id or "", c.reviewer_id or ""))
+    conflicts.sort(
+        key=lambda c: (c.type, c.manuscript_id or "", c.reviewer_id or "", c.track or "")
+    )
     locked_map = {mid: tuple(sorted(rids)) for mid, rids in locked_by_m.items()}
     return locked_map, tuple(conflicts)
 
@@ -458,14 +542,22 @@ def _solve_incremental(
         )
 
     locked_pairs = {(mid, rid) for mid, rids in locked_map.items() for rid in rids}
+    m_by_id = {m.id: m for m in ms}
     locked_count_r: dict[str, int] = {}
+    locked_track_count_r: dict[str, dict[str, int]] = {}
     for mid, rid in locked_pairs:
         locked_count_r[rid] = locked_count_r.get(rid, 0) + 1
+        track = m_by_id[mid].track
+        if track is not None:
+            counts = locked_track_count_r.setdefault(rid, {})
+            counts[track] = counts.get(track, 0) + 1
 
     m_count, r_count = len(ms), len(rs)
 
     SRC = 0
-    SNK = 1 + m_count + r_count
+    # 节点布局与普通模式一致：SRC | 稿件 | 评审人 | (评审人, 赛道) 限额节点 | SNK
+    track_nodes, SNK = _track_node_layout(m_count, rs)
+    track_caps = [dict(r.track_capacities) for r in rs]
 
     def m_node(i: int) -> int:
         return 1 + i
@@ -473,11 +565,21 @@ def _solve_incremental(
     def r_node(j: int) -> int:
         return 1 + m_count + j
 
+    def mr_target(i: int, j: int) -> int:
+        track = ms[i].track
+        if track is not None:
+            node = track_nodes[j].get(track)
+            if node is not None:
+                return node
+        return r_node(j)
+
     eligible = [_eligible_reviewers(m, rs) for m in ms]
 
     # ---- 2. 锁定对固化后，对剩余需求做最小费用最大流 ----
     # 复用 previous 的边费用 0、新增边费用 1：流量固定时费用最小
     # <=> 复用上一轮的分配最多 <=> 新增 + 移除的关系总数最少。
+    # 复用边同样流经 (评审人, 赛道) 限额节点与总容量边：
+    # 历史关系仅在两级容量均允许时才会被复用。
     mf = _MinCostMaxFlow(SNK + 1)
     for i, m in enumerate(ms):
         remaining_req = m.required_reviewers - len(locked_map.get(m.id, ()))
@@ -488,8 +590,16 @@ def _solve_incremental(
             if (m.id, rs[j].id) in locked_pairs:
                 continue  # 锁定对已固化，不再作为候选边
             cost = 0 if (m.id, rs[j].id) in previous else 1
-            ei = mf.add_edge(m_node(i), r_node(j), 1, cost)
+            ei = mf.add_edge(m_node(i), mr_target(i, j), 1, cost)
             mr_edges.append((i, ei, j))
+    track_edge_idx: list[dict[str, int]] = []
+    for j, r in enumerate(rs):
+        locked_tracks = locked_track_count_r.get(r.id, {})
+        edges: dict[str, int] = {}
+        for track, node in track_nodes[j].items():
+            remaining_track = track_caps[j][track] - locked_tracks.get(track, 0)
+            edges[track] = mf.add_edge(node, r_node(j), remaining_track, 0)
+        track_edge_idx.append(edges)
     r_edge_idx: list[int] = []
     for j, r in enumerate(rs):
         remaining_cap = r.capacity - locked_count_r.get(r.id, 0)
@@ -522,6 +632,15 @@ def _solve_incremental(
         )
 
     # ---- 3. 不可行：诊断缺口（残余容量已扣除锁定占用），不输出部分分配 ----
+    def remaining_capacity(j: int, track: str | None) -> int:
+        """评审人 j 对该赛道稿件的剩余可接量：总剩余与赛道剩余取小。"""
+        remaining = mf.residual(r_node(j), r_edge_idx[j])
+        if track is not None:
+            ei = track_edge_idx[j].get(track)
+            if ei is not None:
+                remaining = min(remaining, mf.residual(track_nodes[j][track], ei))
+        return remaining
+
     unsatisfied: list[UnsatisfiedManuscript] = []
     unsat_idx: list[int] = []
     for i, m in enumerate(ms):
@@ -530,7 +649,7 @@ def _solve_incremental(
             continue
         missing = m.required_reviewers - assigned
         elig = eligible[i]
-        remaining = sum(mf.residual(r_node(j), r_edge_idx[j]) for j in elig)
+        remaining = sum(remaining_capacity(j, m.track) for j in elig)
         unsatisfied.append(
             UnsatisfiedManuscript(
                 manuscript_id=m.id,

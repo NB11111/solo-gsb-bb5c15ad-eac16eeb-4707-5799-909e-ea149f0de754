@@ -6,7 +6,9 @@
 - 每篇稿件获得指定数量的评审人；
 - 评审人主题能力与稿件主题匹配；
 - 回避利益冲突（含自稿冲突）；
-- 评审人分配总量不超过其容量。
+- 评审人分配总量不超过其容量；
+- 评审人声明了某赛道限额时，其在该赛道上的分配量不超过对应限额
+  （赛道限额与总容量在同一流网络中联立求解，而非分赛道独立求解后拼接）。
 
 无可行解时返回未满足稿件及候选/容量缺口诊断，**不输出任何部分分配结果**；
 相同输入（甚至不同的列表顺序）必然产生完全相同的输出。服务无状态，不持久化任何数据。
@@ -85,6 +87,11 @@ docker run -p 8000:8000 review-assign
   - 评审人 `id` 出现在稿件 `authors` 中（自稿冲突）；
   - 稿件作者与评审人 `conflicted_authors` 有交集；
   - 稿件 `id` 出现在评审人 `conflicted_manuscripts` 中。
+- 分赛道容量（均可选，省略时行为与历史版本完全一致）：
+  - 稿件 `track`：稿件所属赛道；
+  - 评审人 `track_capacities`：`赛道 -> 非负整数限额` 的映射。稿件赛道出现在某
+    评审人的映射中时，该评审人在此赛道上的分配数不得超过对应限额，且与总容量
+    `capacity` 同时生效；未列入映射的赛道与不携带 `track` 的稿件只受总容量约束。
 - 稿件 / 评审人 `id` 必须各自唯一，否则返回 `422`。
 
 可行时响应（`200`）：
@@ -138,7 +145,8 @@ docker run -p 8000:8000 review-assign
 诊断字段含义：
 
 - `eligible_reviewers`：通过主题与冲突过滤的合格候选人数；
-- `eligible_remaining_capacity`：最大流结束后这些候选的剩余容量之和；
+- `eligible_remaining_capacity`：最大流结束后这些候选对该稿赛道的剩余可接量之和
+  （候选受赛道限额约束时，取总剩余容量与赛道剩余限额的较小者）；
 - `candidate_gap`：候选人数缺口（`required - eligible_reviewers`，候选本身不足）；
 - `capacity_gap`：容量缺口（`missing - eligible_remaining_capacity`，候选够但容量不足）；
 - `shared_pool`：所有未满足稿件共享的候选池及其总/剩余容量，用于定位整体瓶颈。
@@ -174,11 +182,13 @@ docker run -p 8000:8000 review-assign
 
 - `previous_assignments`：上一轮分配结果。求解在保证全局可行的前提下尽量复用这些
   关系，使**新增 + 移除的关系总数最少**；引用已不存在的稿件/评审人、或当前已不满足
-  资格/约束的关系自动视为无法复用（计为移除），不影响求解。
+  资格/约束的关系自动视为无法复用（计为移除），不影响求解。历史关系仅在赛道限额与
+  总容量两级容量均允许时才会被复用。
 - `locked_assignments`：必须原样保留的锁定关系。每条锁定关系必须同时满足：
   - 稿件需求：同一稿件的锁定人数不超过其 `required_reviewers`；
   - 评审资格：与普通分配完全相同的主题匹配与冲突回避校验；
-  - 容量：同一评审人的锁定篇数不超过其 `capacity`。
+  - 容量：同一评审人的锁定篇数不超过其 `capacity`，且同一赛道上的锁定篇数
+    不超过其 `track_capacities` 中对应赛道的限额。
 
   任一锁定关系违反上述约束，即整体判定不可行（`200` + `status: "infeasible"`），
   返回结构化的 `locked_conflicts` 且**不输出任何部分分配**。
@@ -219,6 +229,7 @@ docker run -p 8000:8000 review-assign
       "reviewer_id": "r1",
       "locked": 3,
       "limit": 2,
+      "track": null,
       "detail": "评审人 r1 被锁定 3 篇稿件，超出其容量 2"
     }
   ]
@@ -234,11 +245,91 @@ docker run -p 8000:8000 review-assign
 | `author_conflict` | 评审人与稿件作者存在利益冲突 |
 | `manuscript_conflict` | 评审人已声明回避该稿件 |
 | `topic_mismatch` | 评审人主题能力与稿件主题不匹配 |
-| `reviewer_capacity_exceeded` | 评审人锁定篇数超出容量（`locked` / `limit` 给出数值） |
+| `reviewer_capacity_exceeded` | 评审人锁定篇数超出总容量（`locked` / `limit` 给出数值） |
+| `reviewer_track_capacity_exceeded` | 评审人在某赛道的锁定篇数超出赛道限额（`track` / `locked` / `limit` 给出赛道与数值） |
 | `manuscript_requirement_exceeded` | 稿件锁定人数超出所需评审数（`locked` / `limit` 给出数值） |
 
 增量模式下若锁定关系全部合法但整体仍不可行（容量/候选不足），响应与普通模式
 不可行情形相同：`unsatisfied` + `shared_pool` 缺口诊断，`locked_conflicts` 为 `null`。
+
+### 分赛道容量（可选）
+
+稿件可声明所属赛道 `track`，评审人可通过 `track_capacities` 声明分赛道限额。
+映射中出现的赛道按对应非负整数限额，未列出的赛道只受总容量约束；赛道限额与
+总容量在**同一个流网络中联立求解**（普通最大流与增量最小费用流一致），而非
+分赛道独立求解后拼接：
+
+```json
+{
+  "required_reviewers": 1,
+  "manuscripts": [
+    {"id": "m1", "authors": ["alice"], "topics": ["ml"], "track": "poster"},
+    {"id": "m2", "authors": ["bob"], "topics": ["ml"], "track": "poster"},
+    {"id": "m3", "authors": ["carol"], "topics": ["ml"], "track": "oral"}
+  ],
+  "reviewers": [
+    {"id": "r1", "topics": ["ml"], "capacity": 3, "track_capacities": {"poster": 1}},
+    {"id": "r2", "topics": ["ml"], "capacity": 1}
+  ]
+}
+```
+
+`r1` 总容量 3 但 poster 赛道限额 1：两篇 poster 至多一篇分给 `r1`，另一篇只能给
+`r2`；oral 赛道未列入 `r1` 的映射，只受其总容量约束。可行响应（`200`）：
+
+```json
+{
+  "status": "feasible",
+  "total_required": 3,
+  "total_assigned": 3,
+  "assignments": [
+    {"manuscript_id": "m1", "reviewer_ids": ["r2"]},
+    {"manuscript_id": "m2", "reviewer_ids": ["r1"]},
+    {"manuscript_id": "m3", "reviewer_ids": ["r1"]}
+  ],
+  "unsatisfied": null,
+  "shared_pool": null,
+  "locked_conflicts": null
+}
+```
+
+增量重排模式下，锁定关系同样占用赛道限额：若 `locked_assignments` 使某评审人
+在某赛道的锁定篇数超出对应限额，整体返回 `infeasible` 与结构化
+`locked_conflicts`（类型 `reviewer_track_capacity_exceeded`），不输出部分结果。
+对上述请求追加锁定后：
+
+```json
+{
+  "locked_assignments": [
+    {"manuscript_id": "m1", "reviewer_ids": ["r1"]},
+    {"manuscript_id": "m2", "reviewer_ids": ["r1"]}
+  ]
+}
+```
+
+响应（`200`，`assignments` 为 `null`）：
+
+```json
+{
+  "status": "infeasible",
+  "total_required": 3,
+  "total_assigned": 0,
+  "assignments": null,
+  "unsatisfied": null,
+  "shared_pool": null,
+  "locked_conflicts": [
+    {
+      "type": "reviewer_track_capacity_exceeded",
+      "manuscript_id": null,
+      "reviewer_id": "r1",
+      "locked": 2,
+      "limit": 1,
+      "track": "poster",
+      "detail": "评审人 r1 在赛道 poster 被锁定 2 篇稿件，超出其赛道限额 1"
+    }
+  ]
+}
+```
 
 ### 示例调用
 
@@ -282,18 +373,39 @@ curl -s -X POST http://localhost:8000/assign \
           {"manuscript_id": "m1", "reviewer_ids": ["r1"]}
         ]
       }'
+
+# 分赛道容量：r1 的 poster 赛道限额 1，与总容量 3 同时生效
+curl -s -X POST http://localhost:8000/assign \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "required_reviewers": 1,
+        "manuscripts": [
+          {"id": "m1", "authors": ["alice"], "topics": ["ml"], "track": "poster"},
+          {"id": "m2", "authors": ["bob"],   "topics": ["ml"], "track": "poster"},
+          {"id": "m3", "authors": ["carol"], "topics": ["ml"], "track": "oral"}
+        ],
+        "reviewers": [
+          {"id": "r1", "topics": ["ml"], "capacity": 3, "track_capacities": {"poster": 1}},
+          {"id": "r2", "topics": ["ml"], "capacity": 1}
+        ]
+      }'
 ```
 
 ## 算法与确定性
 
 - 建图：`源 -> 稿件（容量=所需评审数）-> 评审人（容量=1，仅合格）-> 汇（容量=评审容量）`；
   最大流等于总需求即存在满足全部约束的分配，取其流即为解。
+- 分赛道容量：稿件赛道出现在评审人 `track_capacities` 中时，稿件 -> 评审人 的边改经
+  「(评审人, 赛道)」限额节点（`稿件 -> (评审人,赛道) -> 评审人`，中间边容量=赛道限额），
+  赛道限额与总容量在同一流网络中联立求解；未列入映射的赛道仍走直边，只受总容量约束。
 - 全局求解保证整体可行（逐稿贪心无法保证，例如 m1 可选 r1/r2、m2 仅可选 r1 且容量均为 1 时，
   贪心会失败而全局解为 m1→r2、m2→r1）。
-- 增量重排：锁定关系先逐一校验稿件需求、评审资格与容量（任一冲突即整体不可行，
-  返回结构化 `locked_conflicts`），合法锁定对固化后扣减稿件剩余需求与评审剩余容量；
-  其余名额用最小费用最大流（SSP + 势函数）求解——复用 `previous_assignments` 的边
-  费用为 0、新增边费用为 1，流量固定时费用最小即复用最多，亦即新增 + 移除关系总数最少。
+- 增量重排：锁定关系先逐一校验稿件需求、评审资格、总容量与分赛道限额（任一冲突即整体
+  不可行，返回结构化 `locked_conflicts`），合法锁定对固化后扣减稿件剩余需求、评审剩余
+  总容量与剩余赛道限额；其余名额用最小费用最大流（SSP + 势函数）求解——复用
+  `previous_assignments` 的边费用为 0、新增边费用为 1，流量固定时费用最小即复用最多，
+  亦即新增 + 移除关系总数最少；复用边同样流经赛道限额节点，历史关系仅在两级容量
+  均允许时复用。
 - 所有节点按 ID 排序后建图，BFS / Dijkstra 均按固定邻接顺序与 (费用, 节点下标) 字典序
   执行，算法无随机性：相同输入（含不同的列表顺序）产生逐字节相同的输出，
   同成本解由 ID 顺序确定性地破除。

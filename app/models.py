@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+_TrackName = Annotated[str, Field(min_length=1, max_length=128)]
+_TrackCapacity = Annotated[int, Field(ge=0, le=1000)]
 
 
 class ManuscriptIn(BaseModel):
@@ -16,6 +19,10 @@ class ManuscriptIn(BaseModel):
     required_reviewers: int | None = Field(
         default=None, ge=0, le=100,
         description="该稿所需评审数；缺省时使用请求级 required_reviewers",
+    )
+    track: str | None = Field(
+        default=None, min_length=1, max_length=128,
+        description="稿件所属赛道；缺省表示不参与分赛道容量控制",
     )
 
 
@@ -30,6 +37,14 @@ class ReviewerIn(BaseModel):
     )
     conflicted_manuscripts: list[str] = Field(
         default_factory=list, max_length=2048, description="需回避的稿件 ID 列表"
+    )
+    track_capacities: dict[_TrackName, _TrackCapacity] | None = Field(
+        default=None, max_length=64,
+        description=(
+            "分赛道容量：赛道 -> 该赛道最多可评审的稿件数（非负整数）。"
+            "映射中出现的赛道同时受赛道限额与总容量约束；"
+            "未列出的赛道仅受总容量约束"
+        ),
     )
 
 
@@ -116,6 +131,7 @@ class LockedConflictOut(BaseModel):
         "manuscript_conflict",
         "topic_mismatch",
         "reviewer_capacity_exceeded",
+        "reviewer_track_capacity_exceeded",
         "manuscript_requirement_exceeded",
     ]
     manuscript_id: str | None = None
@@ -123,6 +139,8 @@ class LockedConflictOut(BaseModel):
     # 仅容量/需求类冲突携带：实际锁定数与上限
     locked: int | None = None
     limit: int | None = None
+    # 仅分赛道容量冲突携带：被超出限额的赛道
+    track: str | None = None
     detail: str
 
 

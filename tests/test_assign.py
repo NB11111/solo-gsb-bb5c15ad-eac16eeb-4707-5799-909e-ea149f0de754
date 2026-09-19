@@ -12,18 +12,20 @@ client = TestClient(app)
 
 
 def _verify_constraints(body: dict, response: dict) -> None:
-    """校验分配结果满足全部约束：篇均评审数、容量、主题匹配、冲突回避。"""
+    """校验分配结果满足全部约束：篇均评审数、容量、赛道限额、主题匹配、冲突回避。"""
     assert response["status"] == "feasible"
     assignments = {a["manuscript_id"]: a["reviewer_ids"] for a in response["assignments"]}
     reviewers = {r["id"]: r for r in body["reviewers"]}
     default_req = body.get("required_reviewers", 1)
 
     used = {rid: 0 for rid in reviewers}
+    track_used: dict[str, dict[str, int]] = {rid: {} for rid in reviewers}
     for m in body["manuscripts"]:
         rid_list = assignments[m["id"]]
         req = m.get("required_reviewers") or default_req
         assert len(rid_list) == req, f"{m['id']} 评审数不足"
         assert len(set(rid_list)) == len(rid_list), "同一稿件重复分配评审人"
+        track = m.get("track")
         for rid in rid_list:
             r = reviewers[rid]
             used[rid] += 1
@@ -32,8 +34,16 @@ def _verify_constraints(body: dict, response: dict) -> None:
             assert m["id"] not in r.get("conflicted_manuscripts", [])
             if m["topics"]:
                 assert set(m["topics"]) & set(r["topics"]), "主题不匹配"
+            if track is not None:
+                per = track_used[rid]
+                per[track] = per.get(track, 0) + 1
     for rid, n in used.items():
         assert n <= reviewers[rid]["capacity"], f"{rid} 超出容量"
+    for rid, per_track in track_used.items():
+        caps = reviewers[rid].get("track_capacities") or {}
+        for track, n in per_track.items():
+            if track in caps:
+                assert n <= caps[track], f"{rid} 赛道 {track} 超出限额"
 
 
 # ---------- 健康检查 ----------
@@ -646,3 +656,264 @@ def test_pair_ineligibility_reasons_matches_eligible():
                 assert (not _pair_ineligibility_reasons(m, r)) == (
                     r.id in eligible_ids
                 )
+
+
+# ---------- 分赛道容量：普通模式 ----------
+
+def test_track_capacity_limits_normal_mode():
+    """r1 总容量 3 但 poster 赛道限额 1：两篇 poster 至多一篇分给 r1。"""
+    body = {
+        "required_reviewers": 1,
+        "manuscripts": [
+            {"id": "m1", "authors": [], "topics": ["t"], "track": "poster"},
+            {"id": "m2", "authors": [], "topics": ["t"], "track": "poster"},
+            {"id": "m3", "authors": [], "topics": ["t"], "track": "oral"},
+        ],
+        "reviewers": [
+            {"id": "r1", "topics": ["t"], "capacity": 3,
+             "track_capacities": {"poster": 1}},
+            {"id": "r2", "topics": ["t"], "capacity": 1},
+        ],
+    }
+    data = client.post("/assign", json=body).json()
+    assert data["status"] == "feasible"
+    _verify_constraints(body, data)
+    # 确定性结果：m1->r2，m2->r1（占用其唯一 poster 名额），m3->r1
+    assignments = {a["manuscript_id"]: a["reviewer_ids"] for a in data["assignments"]}
+    assert assignments == {"m1": ["r2"], "m2": ["r1"], "m3": ["r1"]}
+
+
+def test_track_and_total_capacity_solved_jointly():
+    """赛道限额与总容量联立求解：各赛道限额都够，但总容量不够即不可行。
+
+    若分赛道独立求解后拼接，会误判可行（A: 2<=2，B: 2<=2）；
+    统一流网络中总容量 3 < 总需求 4，必须判定不可行。
+    """
+    body = {
+        "required_reviewers": 1,
+        "manuscripts": [
+            {"id": "m1", "authors": [], "topics": ["t"], "track": "A"},
+            {"id": "m2", "authors": [], "topics": ["t"], "track": "A"},
+            {"id": "m3", "authors": [], "topics": ["t"], "track": "B"},
+            {"id": "m4", "authors": [], "topics": ["t"], "track": "B"},
+        ],
+        "reviewers": [
+            {"id": "r1", "topics": ["t"], "capacity": 3,
+             "track_capacities": {"A": 2, "B": 2}},
+        ],
+    }
+    data = client.post("/assign", json=body).json()
+    assert data["status"] == "infeasible"
+    assert data["assignments"] is None
+    assert data["total_required"] == 4
+    assert data["total_assigned"] == 3
+
+
+def test_unlisted_track_only_total_capacity():
+    """未列入 track_capacities 的赛道只受总容量约束。"""
+    body = {
+        "required_reviewers": 1,
+        "manuscripts": [
+            {"id": "m1", "authors": [], "topics": ["t"], "track": "A"},
+            {"id": "m2", "authors": [], "topics": ["t"], "track": "B"},
+            {"id": "m3", "authors": [], "topics": ["t"], "track": "B"},
+        ],
+        "reviewers": [
+            {"id": "r1", "topics": ["t"], "capacity": 3,
+             "track_capacities": {"A": 1}},
+        ],
+    }
+    data = client.post("/assign", json=body).json()
+    assert data["status"] == "feasible"
+    _verify_constraints(body, data)
+    assignments = {a["manuscript_id"]: a["reviewer_ids"] for a in data["assignments"]}
+    assert assignments == {"m1": ["r1"], "m2": ["r1"], "m3": ["r1"]}
+
+
+def test_manuscript_without_track_unaffected():
+    """不携带 track 的稿件不受任何赛道限额约束。"""
+    body = {
+        "required_reviewers": 1,
+        "manuscripts": [
+            {"id": "m1", "authors": [], "topics": ["t"], "track": "A"},
+            {"id": "m2", "authors": [], "topics": ["t"]},
+        ],
+        "reviewers": [
+            {"id": "r1", "topics": ["t"], "capacity": 2,
+             "track_capacities": {"A": 0}},
+        ],
+    }
+    data = client.post("/assign", json=body).json()
+    assert data["status"] == "infeasible"  # m1 的赛道 A 限额为 0，只能分给 r1 之外的人
+    assert data["unsatisfied"][0]["manuscript_id"] == "m1"
+
+
+def test_track_capacity_zero_diagnosed_as_capacity_gap():
+    """赛道限额 0：候选存在但该赛道剩余容量为 0，报容量缺口而非候选缺口。"""
+    body = {
+        "manuscripts": [
+            {"id": "m1", "authors": [], "topics": ["t"], "track": "A",
+             "required_reviewers": 1},
+        ],
+        "reviewers": [
+            {"id": "r1", "topics": ["t"], "capacity": 5,
+             "track_capacities": {"A": 0}},
+        ],
+    }
+    data = client.post("/assign", json=body).json()
+    assert data["status"] == "infeasible"
+    u = data["unsatisfied"][0]
+    assert u["eligible_reviewers"] == 1
+    assert u["eligible_remaining_capacity"] == 0
+    assert u["candidate_gap"] == 0
+    assert u["capacity_gap"] == 1
+
+
+def test_track_deterministic_and_order_independent():
+    body = {
+        "required_reviewers": 1,
+        "manuscripts": [
+            {"id": f"m{i}", "authors": [], "topics": ["t"], "track": track}
+            for i, track in enumerate(["A", "B", "A", "B", "C"])
+        ],
+        "reviewers": [
+            {"id": "r1", "topics": ["t"], "capacity": 3,
+             "track_capacities": {"A": 1, "B": 2}},
+            {"id": "r2", "topics": ["t"], "capacity": 2,
+             "track_capacities": {"B": 1}},
+            {"id": "r3", "topics": ["t"], "capacity": 2},
+        ],
+    }
+    r1 = client.post("/assign", json=body).json()
+    assert r1["status"] == "feasible"
+    _verify_constraints(body, r1)
+    r2 = client.post("/assign", json=body).json()
+    assert r1 == r2
+    shuffled = {
+        "manuscripts": list(reversed(body["manuscripts"])),
+        "reviewers": list(reversed(body["reviewers"])),
+    }
+    r3 = client.post("/assign", json=shuffled).json()
+    assert r1 == r3
+
+
+def test_negative_track_capacity_rejected():
+    body = {
+        "manuscripts": [],
+        "reviewers": [
+            {"id": "r1", "capacity": 1, "track_capacities": {"A": -1}},
+        ],
+    }
+    resp = client.post("/assign", json=body)
+    assert resp.status_code == 422
+
+
+# ---------- 分赛道容量：增量重排模式 ----------
+
+def test_incremental_locked_consumes_track_capacity():
+    """锁定占用赛道限额后，同赛道剩余名额必须改走其他评审人。"""
+    body = {
+        "required_reviewers": 1,
+        "manuscripts": [
+            {"id": "m1", "authors": [], "topics": ["t"], "track": "A"},
+            {"id": "m2", "authors": [], "topics": ["t"], "track": "A"},
+        ],
+        "reviewers": [
+            {"id": "r1", "topics": ["t"], "capacity": 2,
+             "track_capacities": {"A": 1}},
+            {"id": "r2", "topics": ["t"], "capacity": 1},
+        ],
+        "locked_assignments": [
+            {"manuscript_id": "m1", "reviewer_ids": ["r1"]},
+        ],
+    }
+    data = client.post("/assign", json=body).json()
+    assert data["status"] == "feasible"
+    _verify_constraints(body, data)
+    assignments = {a["manuscript_id"]: a["reviewer_ids"] for a in data["assignments"]}
+    assert assignments == {"m1": ["r1"], "m2": ["r2"]}
+
+
+def test_locked_exceeds_track_capacity_rejected():
+    """锁定数超出赛道限额（总容量未超）：整体不可行，返回新冲突类型。"""
+    body = {
+        "required_reviewers": 1,
+        "manuscripts": [
+            {"id": "m1", "authors": [], "topics": ["t"], "track": "A"},
+            {"id": "m2", "authors": [], "topics": ["t"], "track": "A"},
+        ],
+        "reviewers": [
+            {"id": "r1", "topics": ["t"], "capacity": 5,
+             "track_capacities": {"A": 1}},
+            {"id": "r2", "topics": ["t"], "capacity": 1},
+        ],
+        "locked_assignments": [
+            {"manuscript_id": "m1", "reviewer_ids": ["r1"]},
+            {"manuscript_id": "m2", "reviewer_ids": ["r1"]},
+        ],
+    }
+    data = client.post("/assign", json=body).json()
+    assert data["status"] == "infeasible"
+    # 不输出部分结果，也不给缺口诊断，只给锁定冲突
+    assert data["assignments"] is None
+    assert data["unsatisfied"] is None
+    assert data["shared_pool"] is None
+    conflicts = data["locked_conflicts"]
+    assert len(conflicts) == 1
+    assert conflicts[0]["type"] == "reviewer_track_capacity_exceeded"
+    assert conflicts[0]["reviewer_id"] == "r1"
+    assert conflicts[0]["track"] == "A"
+    assert conflicts[0]["locked"] == 2
+    assert conflicts[0]["limit"] == 1
+
+
+def test_incremental_previous_reuse_respects_track_capacity():
+    """previous 中两条 A 赛道关系，r1 的 A 赛道限额 1：最多复用一条。"""
+    body = {
+        "required_reviewers": 1,
+        "manuscripts": [
+            {"id": "m1", "authors": [], "topics": ["t"], "track": "A"},
+            {"id": "m2", "authors": [], "topics": ["t"], "track": "A"},
+        ],
+        "reviewers": [
+            {"id": "r1", "topics": ["t"], "capacity": 5,
+             "track_capacities": {"A": 1}},
+            {"id": "r2", "topics": ["t"], "capacity": 5},
+        ],
+        "previous_assignments": [
+            {"manuscript_id": "m1", "reviewer_ids": ["r1"]},
+            {"manuscript_id": "m2", "reviewer_ids": ["r1"]},
+        ],
+    }
+    data = client.post("/assign", json=body).json()
+    assert data["status"] == "feasible"
+    _verify_constraints(body, data)
+    # 确定性：复用 m1->r1（费用 0），m2 改分 r2（1 新增 1 移除，已是最少改动）
+    assignments = {a["manuscript_id"]: a["reviewer_ids"] for a in data["assignments"]}
+    assert assignments == {"m1": ["r1"], "m2": ["r2"]}
+
+
+def test_incremental_track_infeasible_still_diagnoses():
+    """增量模式下赛道限额导致整体不可行时，仍返回缺口诊断且不输出部分分配。"""
+    body = {
+        "required_reviewers": 1,
+        "manuscripts": [
+            {"id": "m1", "authors": [], "topics": ["t"], "track": "A"},
+            {"id": "m2", "authors": [], "topics": ["t"], "track": "A"},
+        ],
+        "reviewers": [
+            {"id": "r1", "topics": ["t"], "capacity": 5,
+             "track_capacities": {"A": 1}},
+        ],
+        "previous_assignments": [
+            {"manuscript_id": "m1", "reviewer_ids": ["r1"]},
+        ],
+    }
+    data = client.post("/assign", json=body).json()
+    assert data["status"] == "infeasible"
+    assert data["assignments"] is None
+    assert data["locked_conflicts"] is None
+    unsat = {u["manuscript_id"]: u for u in data["unsatisfied"]}
+    assert set(unsat) == {"m2"}
+    assert unsat["m2"]["eligible_remaining_capacity"] == 0
+    assert unsat["m2"]["capacity_gap"] == 1

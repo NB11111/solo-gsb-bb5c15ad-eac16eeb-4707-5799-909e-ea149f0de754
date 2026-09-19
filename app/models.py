@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -13,6 +13,15 @@ class ManuscriptIn(BaseModel):
     id: str = Field(min_length=1, max_length=128, description="稿件 ID（唯一）")
     authors: list[str] = Field(default_factory=list, max_length=512, description="作者名单")
     topics: list[str] = Field(default_factory=list, max_length=64, description="稿件主题")
+    track: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        description=(
+            "所属赛道（可选）。带赛道的稿件只能占用评审人 track_capacities 中"
+            "该赛道的限额；缺省/为 null 时不受任何赛道限额约束"
+        ),
+    )
     required_reviewers: int | None = Field(
         default=None, ge=0, le=100,
         description="该稿所需评审数；缺省时使用请求级 required_reviewers",
@@ -24,7 +33,18 @@ class ReviewerIn(BaseModel):
 
     id: str = Field(min_length=1, max_length=128, description="评审人 ID（唯一）")
     topics: list[str] = Field(default_factory=list, max_length=64, description="主题能力")
-    capacity: int = Field(ge=0, le=1000, description="最多可评审稿件数")
+    capacity: int = Field(ge=0, le=1000, description="最多可评审稿件数（总容量）")
+    track_capacities: dict[
+        Annotated[str, Field(min_length=1, max_length=128)],
+        Annotated[int, Field(ge=0, le=1000)],
+    ] | None = Field(
+        default=None,
+        max_length=1000,
+        description=(
+            "分赛道容量（可选）。映射中出现的赛道按对应非负整数限额评审；"
+            "未列出的赛道（以及不带赛道的稿件）只受总容量 capacity 约束"
+        ),
+    )
     conflicted_authors: list[str] = Field(
         default_factory=list, max_length=2048, description="存在利益冲突的作者名单"
     )
@@ -66,7 +86,7 @@ class AssignRequest(BaseModel):
         default=None, max_length=10000,
         description=(
             "必须保留的锁定分配（增量重排模式）。任一锁定关系不满足稿件需求、"
-            "评审资格或容量约束时，整体判定不可行并返回结构化冲突原因"
+            "评审资格、评审总容量或分赛道限额时，整体判定不可行并返回结构化冲突原因"
         ),
     )
 
@@ -116,10 +136,13 @@ class LockedConflictOut(BaseModel):
         "manuscript_conflict",
         "topic_mismatch",
         "reviewer_capacity_exceeded",
+        "reviewer_track_capacity_exceeded",
         "manuscript_requirement_exceeded",
     ]
     manuscript_id: str | None = None
     reviewer_id: str | None = None
+    # 仅分赛道容量冲突携带：超出限额的赛道
+    track: str | None = None
     # 仅容量/需求类冲突携带：实际锁定数与上限
     locked: int | None = None
     limit: int | None = None
